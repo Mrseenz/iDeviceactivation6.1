@@ -197,12 +197,17 @@ namespace WindowsFormsApp
         private void BtnManageDevices_Click(object sender, EventArgs e)
         {
             // This is where you would open a new Form/Dialog for device management.
-            // For now, let's log a message.
-            LogMessage("Manage Devices button clicked. (Functionality to be implemented in a separate form/dialog)");
-            // Example:
-            // ManageDevicesForm manageForm = new ManageDevicesForm(this.LogMessage); // Pass logger
-            // manageForm.ShowDialog(this);
-            MessageBox.Show("Device management UI is not yet implemented in this version.", "Manage Devices", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            LogMessage("Opening Manage Devices window...");
+            try
+            {
+                ManageDevicesForm manageForm = new ManageDevicesForm(this.LogMessage); // Pass logger delegate
+                manageForm.ShowDialog(this); // Show as a modal dialog
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error opening Manage Devices window: {ex.Message}");
+                MessageBox.Show($"Could not open device manager: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
 
