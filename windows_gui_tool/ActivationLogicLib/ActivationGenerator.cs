@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Cryptography.Pkcs; // For SignedCms
 using Newtonsoft.Json; // For JSON operations, e.g. RegulatoryInfo. NuGet: Newtonsoft.Json
+// using System.Globalization; // Not directly used, can be removed if no specific culture formatting needed
 
 namespace ActivationLogicLib
 {
@@ -21,7 +22,6 @@ namespace ActivationLogicLib
     {
         private Dictionary<string, string> _deviceInfo;
 
-        // Keys and Certificates
         private RSA _rootCaKey;
         private X509Certificate2 _rootCaCert;
         private RSA _deviceCaKey;
@@ -32,6 +32,8 @@ namespace ActivationLogicLib
         private X509Certificate2 _deviceCertificate;
 
         private const int RsaKeySizeBits = 2048;
+        private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
+
 
         public ActivationGenerator(byte[] requestPlistBytes)
         {
@@ -55,7 +57,7 @@ namespace ActivationLogicLib
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ActivationGenerator] Constructor Error: {ex.GetType().Name} - {ex.Message}");
+                Console.WriteLine($"[ActivationGenerator] Constructor Error: {ex.GetType().Name} - {ex.Message}{Environment.NewLine}Trace: {ex.StackTrace}");
                 throw new ActivationGeneratorException($"Failed to initialize ActivationGenerator: {ex.Message}", ex);
             }
         }
@@ -70,7 +72,8 @@ namespace ActivationLogicLib
                 XDocument plistDoc;
                 using (var stream = new MemoryStream(requestPlistBytes))
                 {
-                    plistDoc = XDocument.Load(stream);
+                    // Apple Plists might not have XML declaration, XDocument.Load is fine.
+                    plistDoc = XDocument.Load(stream, LoadOptions.None);
                 }
 
                 XElement dictElement = plistDoc.Root?.Element("dict");
@@ -84,7 +87,7 @@ namespace ActivationLogicLib
                     if (i + 1 < elements.Count)
                     {
                         XElement valueNode = elements[i + 1];
-                        if (valueNode.Name == "dict")
+                        if (valueNode.Name == "dict") // Flatten one level, as in original PHP
                         {
                             var subElements = valueNode.Elements().ToList();
                             for (int j = 0; j < subElements.Count; j++)
@@ -93,14 +96,14 @@ namespace ActivationLogicLib
                                 if (j + 1 < subElements.Count)
                                 {
                                     info[subElements[j].Value] = subElements[j + 1].Value;
-                                    j++; // Increment for value
+                                    j++;
                                 }
                             }
                         }
-                        else if (valueNode.Name == "true") info[key] = "1";
+                        else if (valueNode.Name == "true") info[key] = "1"; // Match Python/PHP string bool
                         else if (valueNode.Name == "false") info[key] = "";
-                        else info[key] = valueNode.Value;
-                        i++; // Increment for value
+                        else info[key] = valueNode.Value; // Includes <string>, <integer>, etc.
+                        i++;
                     }
                 }
             }
@@ -111,13 +114,11 @@ namespace ActivationLogicLib
             return info;
         }
 
-        private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
-
         private static byte[] GenerateX509SerialNumber()
         {
             byte[] serialNumber = new byte[16];
             _rng.GetBytes(serialNumber);
-            serialNumber[0] = (byte)(serialNumber[0] & 0x7F); // Ensure positive
+            serialNumber[0] = (byte)(serialNumber[0] & 0x7F); // Ensure positive for BigInteger if used elsewhere
             return serialNumber;
         }
 
@@ -131,40 +132,54 @@ namespace ActivationLogicLib
             {
                 subjectNameBuilder.Append($", OU={subjectOrganizationalUnit}");
             }
-            var subjectName = new X500DistinguishedName(subjectNameBuilder.ToString());
+            // For server cert, more fields might be needed if replicating Apple's cert more closely
+            if (!isCa && subjectCommonName == "albert.apple.com") {
+                 subjectNameBuilder.Append($", L=Cupertino, ST=California, C=US"); // ST for stateOrProvinceName
+            }
 
+            var subjectName = new X500DistinguishedName(subjectNameBuilder.ToString());
             var request = new CertificateRequest(subjectName, subjectKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
 
-            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(isCa, isCa, 0, true)); // pathLengthConstraint only if isCa is true
+            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(isCa, isCa, 0, true));
 
-            X509KeyUsageFlags usageFlags = X509KeyUsageFlags.DigitalSignature;
-            if (isCa) usageFlags |= X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign;
-            else usageFlags |= X509KeyUsageFlags.KeyEncipherment | X509KeyUsageFlags.DataEncipherment; // For EE certs
+            X509KeyUsageFlags usageFlags = X509KeyUsageFlags.DigitalSignature; // Common for all
+            if (isCa) {
+                usageFlags |= X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign;
+            } else { // End-entity
+                usageFlags |= X509KeyUsageFlags.KeyEncipherment | X509KeyUsageFlags.DataEncipherment;
+            }
             request.CertificateExtensions.Add(new X509KeyUsageExtension(usageFlags, true));
 
-            request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+            // Subject Key Identifier
+            byte[] subjectPublicKeyBytes = subjectKey.ExportSubjectPublicKeyInfo();
+            var skiBuilder = new SubjectAlternativeNameBuilder(); // Misusing SAN builder just to get a hash easily for SKI from public key bytes
+            skiBuilder.AddDnsName("temp"); // dummy value, we only want the hash of key
+            var tempSki = new X509SubjectKeyIdentifierExtension(subjectPublicKeyBytes, X509SubjectKeyIdentifierHashAlgorithm.Sha1, false); // Sha1 is common for SKI
+            request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(tempSki.SubjectKeyIdentifierBytes, false));
+
 
             DateTimeOffset notBefore = DateTimeOffset.UtcNow.AddDays(-1);
             DateTimeOffset notAfter = notBefore.AddDays(validityDays);
             byte[] serialNumber = GenerateX509SerialNumber();
 
             X509Certificate2 cert;
-            if (issuerCertificate != null && issuerSigningKey != null) // Issued by another CA
-            {
-                // Create AuthorityKeyIdentifier from issuer's SubjectKeyIdentifier
-                var issuerSki = issuerCertificate.Extensions.OfType<X509SubjectKeyIdentifierExtension>().FirstOrDefault();
-                if (issuerSki != null)
-                {
-                    var akie = new X509AuthorityKeyIdentifierExtension(X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(issuerSki.SubjectKeyIdentifierBytes), false);
-                    request.CertificateExtensions.Add(akie);
-                }
-                cert = request.Create(issuerCertificate.SubjectName, X509SignatureGenerator.CreateForRSA(issuerSigningKey, RSASignaturePadding.Pkcs1), notBefore, notAfter, serialNumber);
+            X500DistinguishedName finalIssuerName = (issuerCertificate != null) ? issuerCertificate.SubjectName : subjectName;
+            RSA finalIssuerKey = (issuerSigningKey != null) ? issuerSigningKey : subjectKey; // Self-signing key if issuer is null
+
+            if (issuerCertificate != null) { // Add AKI if not self-signed
+                 var issuerSkiExt = issuerCertificate.Extensions.OfType<X509SubjectKeyIdentifierExtension>().FirstOrDefault();
+                 if (issuerSkiExt != null) {
+                    request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(issuerSkiExt.SubjectKeyIdentifierBytes));
+                 } else { // Fallback if issuer SKI not found (less ideal)
+                    request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromIssuerNameAndSerialNumber(issuerCertificate.IssuerName, issuerCertificate.GetSerialNumber()));
+                 }
             }
-            else // Self-signed (Root CA)
-            {
-                cert = request.CreateSelfSigned(notBefore, notAfter);
-            }
-            return cert;
+
+            cert = request.Create(finalIssuerName, X509SignatureGenerator.CreateForRSA(finalIssuerKey, RSASignaturePadding.Pkcs1), notBefore, notAfter, serialNumber);
+
+            // For operations requiring the private key with the certificate (like CmsSigner), associate it.
+            // This returns a new X509Certificate2 instance.
+            return cert.CopyWithPrivateKey(subjectKey);
         }
 
         private void GenerateCaCredentials()
@@ -179,18 +194,8 @@ namespace ActivationLogicLib
         private void GenerateServerCredentials()
         {
             _serverPrivateKey = RSA.Create(RsaKeySizeBits);
-            // For albert.apple.com cert, specific DN structure
-            var subjectName = new X500DistinguishedName("CN=albert.apple.com, O=Apple Inc., L=Cupertino, S=California, C=US");
-            var request = new CertificateRequest(subjectName, _serverPrivateKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-            request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
-            request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
-
-            DateTimeOffset notBefore = DateTimeOffset.UtcNow.AddDays(-1);
-            DateTimeOffset notAfter = notBefore.AddDays(365);
-            byte[] serialNumber = GenerateX509SerialNumber();
-
-            _serverCertificate = request.Create(_rootCaCert.SubjectName, X509SignatureGenerator.CreateForRSA(_rootCaKey, RSASignaturePadding.Pkcs1), notBefore, notAfter, serialNumber);
+            // DN for server cert is more specific, handled in CreateCertificate
+            _serverCertificate = CreateCertificate("albert.apple.com", "Apple Inc.", null, 365, _serverPrivateKey, _rootCaCert, _rootCaKey, false);
         }
 
         private void GenerateDeviceCredentials()
@@ -201,13 +206,17 @@ namespace ActivationLogicLib
                 3650, _devicePrivateKey, _deviceCaCert, _deviceCaKey, false);
         }
 
-        private byte[] SignDataPkcs7Detached(byte[] dataToSign, X509Certificate2 signingCertificate, RSA signingKey)
+        private byte[] SignDataPkcs7Detached(byte[] dataToSign, X509Certificate2 signingCertificateWithKey)
         {
             ContentInfo contentInfo = new ContentInfo(dataToSign);
-            SignedCms signedCms = new SignedCms(contentInfo, true); // Detached signature
+            SignedCms signedCms = new SignedCms(contentInfo, true); // Detached
 
-            CmsSigner cmsSigner = new CmsSigner(SubjectIdentifierType.IssuerAndSerialNumber, signingCertificate.CopyWithPrivateKey(signingKey));
-            cmsSigner.DigestAlgorithm = new Oid(HashAlgorithmName.SHA256.Name, HashAlgorithmName.SHA256.Name); // SHA256 OID
+            CmsSigner cmsSigner = new CmsSigner(signingCertificateWithKey);
+            cmsSigner.DigestAlgorithm = new Oid("2.16.840.1.101.3.4.2.1"); // SHA256 OID
+            // Include a list of certificates in the PKCS#7 message (chain) if needed by recipient
+            // cmsSigner.IncludeOption = X509IncludeOption.Chain; // Or .EndCertOnly
+            // signedCms.Certificates.Add(...) can also be used.
+            // For simple detached signature, often only signer's cert is included by default.
 
             signedCms.ComputeSignature(cmsSigner);
             return signedCms.Encode();
@@ -224,13 +233,13 @@ namespace ActivationLogicLib
             string ticketContentJson = JsonConvert.SerializeObject(ticketContentDict);
             byte[] ticketContentJsonBytes = Encoding.UTF8.GetBytes(ticketContentJson);
 
-            byte[] signedPkcs7Der = SignDataPkcs7Detached(ticketContentJsonBytes, _serverCertificate, _serverPrivateKey);
+            // _serverCertificate should have its private key associated from CreateCertificate
+            byte[] signedPkcs7Der = SignDataPkcs7Detached(ticketContentJsonBytes, _serverCertificate);
             return Convert.ToBase64String(signedPkcs7Der);
         }
 
         private string GenerateAccountTokenPayload(string wildcardTicketB64Str)
         {
-             // This custom format is tricky. Replicating the PHP string builder.
             var tokenData = new Dictionary<string, object>
             {
                 {"InternationalMobileEquipmentIdentity", _deviceInfo.TryGetValue("InternationalMobileEquipmentIdentity", out var imei) ? imei : ""},
@@ -242,7 +251,7 @@ namespace ActivationLogicLib
                 {"SerialNumber", _deviceInfo["SerialNumber"]},
                 {"MobileEquipmentIdentifier", _deviceInfo.TryGetValue("MobileEquipmentIdentifier", out var mei) ? mei : ""},
                 {"InternationalMobileEquipmentIdentity2", _deviceInfo.TryGetValue("InternationalMobileEquipmentIdentity2", out var imei2) ? imei2 : ""},
-                {"PostponementInfo", new Dictionary<string,string>()}, // Empty object for "{};"
+                {"PostponementInfo", new Dictionary<string,string>()},
                 {"ActivationRandomness", _deviceInfo.TryGetValue("ActivationRandomness", out var ar2) ? ar2 : ""},
                 {"ActivityURL", "https://albert.apple.com/deviceservices/activity"},
                 {"IntegratedCircuitCardIdentity", _deviceInfo.TryGetValue("IntegratedCircuitCardIdentity", out var iccid) ? iccid : ""},
@@ -275,6 +284,8 @@ namespace ActivationLogicLib
 
         private byte[] AssembleActivationRecordPlist(Dictionary<string, object> components)
         {
+            // This method constructs an XML Plist where <data> elements contain *already base64 encoded strings*
+            // This matches the observed output of the original PHP script.
             var activationRecordDictContent = new List<XObject>();
             foreach (var kvp in components)
             {
@@ -283,9 +294,11 @@ namespace ActivationLogicLib
                 {
                     activationRecordDictContent.Add(new XElement(bVal ? "true" : "false"));
                 }
-                else // All other values (already base64 strings) go into <data> tags as per PHP output
+                else
                 {
-                     activationRecordDictContent.Add(new XElement("data", kvp.Value.ToString()));
+                    // All other values are expected to be strings (some already base64)
+                    // and will be placed as the text content of a <data> tag.
+                    activationRecordDictContent.Add(new XElement("data", kvp.Value.ToString()));
                 }
             }
             var activationRecordDict = new XElement("dict", activationRecordDictContent.ToArray());
@@ -300,16 +313,13 @@ namespace ActivationLogicLib
                 new XElement("plist", new XAttribute("version", "1.0"), rootDict)
             );
 
-            using (var ms = new MemoryStream())
-            using (var writer = new System.Xml.XmlTextWriter(ms, Encoding.UTF8) { Formatting = System.Xml.Formatting.Indented }) // For pretty print
-            {
-                // .NET XDocument.ToString() or .Save() doesn't always match exact plist formatting (e.g. self-closing tags).
-                // For precise control, manual string building or specific plist libraries are better.
-                // For now, standard XDocument save.
-                plistDoc.Save(writer);
-                writer.Flush();
-                return ms.ToArray();
-            }
+            // Output XML string. Using StringWriter for specific encoding and formatting.
+            // Apple plists are typically UTF-8 and indented.
+            var sw = new StringWriter();
+            var xtw = new System.Xml.XmlTextWriter(sw) { Formatting = System.Xml.Formatting.Indented, Indentation = 1, IndentChar = '\t' };
+            plistDoc.WriteTo(xtw);
+            xtw.Flush();
+            return Encoding.UTF8.GetBytes(sw.ToString());
         }
 
         private string GenerateRegulatoryInfo() {
@@ -318,10 +328,10 @@ namespace ActivationLogicLib
         }
 
         private string GenerateFairPlayKeyData() {
-            // Corrected padding from original PHP: 2124 chars, ends "Cg="
-            return "LS0tLS1CRUdJTiBDT05UQUlORVItLS0tLQpBQUVBQVQzOGVycGgzbW9HSGlITlFTMU5YcTA1QjFzNUQ2UldvTHhRYWpKODVDWEZLUldvMUI2c29Pd1kzRHUyClJtdWtIemlLOFV5aFhGV1N1OCtXNVI4dEJtM3MrQ2theGpUN2hnQVJ5S0o0U253eE4vU3U2aW9ZeDE3dVFld0IKZ1pqc2hZeitkemlXU2I4U2tRQzdFZEZZM0Z2bWswQXE3ZlVnY3JhcTZqU1g4MUZWcXc1bjNpRlQwc0NRSXhibgpBQkVCQ1JZazlodFlML3RlZ0kzc29DeUZzcmM1TTg1OXhTcHRGNFh2ejU1UVZDQkw1OFdtSzZnVFNjVHlVSDN3CjJSVERXUjNGRnJxR2Y3aTVCV1lxRVdLMEkzNFgyTWJsZnR4OTM3bmI3SysrTFVkYk81YnFZaDM0bTREcUZwbCsKZkRnaDVtdU1DNkVlWWZPeTlpdEJsbE5ad2VlUWJBUmtKa2FHUGJ5aEdpYlNCcTZzR0NrQVJ2WTltT2ZNT3hZYgplWitlNnhBRmZ4MjFwUk9BM0xZc0FmMzBycmtRc0tKODVBRHZVMzFKdUFibnpmeGQzRnorbHBXRi9FeHU5QVNtCm1XcFFTY1VZaXF5TXZHUWQ5Rnl6ZEtNYk1SQ1ExSWpGZVhOUWhWQTY0VzY4M0czbldzRjR3a3lFRHl5RnI1N2QKcUJ3dFA4djRhSXh4ZHVSODVaT0lScWs0UGlnVlUvbVRpVUVQem16Wlh2MVB3ZzNlOGpjL3pZODZoYWZHaDZsZApMbHAyTU9uakNuN1pmKzFFN0RpcTNrS280bVo0MHY0cEJOV1BodnZGZ0R5WDdSLy9UaTBvbCtnbzc1QmR2b1NpCmljckUzYUdOc0hhb0d6cE90SHVOdW5HNTh3UW9BWXMwSUhQOGNvdmxPMDhHWHVRUlh1NVYyM1VyK2ZLQ2t5dm8KSEptYWVmL29ZbmR3QzAvK1pUL2FOeTZKUUEzUzw1Y3dzaFE3YXpYajlZazNndzkzcE0xN3I5dExGejNHWDRQegoyZWhMclVOTCtZcSs1bW1zeTF6c2RlcENGMldkR09KbThnajluMjdHUDNVVnhUOVA4TkI0K1YwNzlEWXd6TEdiCjhLdGZCRExSM2cwSXppYkZQNzZ5VC9FTDUwYmlacU41SlNLYnoxS2lZSGlGS05CYnJEbDlhWWFNdnFJNHhOblgKNVdpZk43WDk3UHE0TFQzYW5rcmhUZUVqeXFxeC9kYmovMGh6bG1RRCtMaW5UV29SU2ZFVWI2Ni9peHFFb3BrbQp3V2h6dXZPMUVPaTRseUJUV09MdmxUY1h1WUpwTUpRZHNCb0dkSVdrbm80Qnp5N3BESXMvSXpNUVEzaUpEYVc3CnBiTldrSUNTdytEVWJPdDVXZFZqN0FHTEFUR2FVRW1ZS1dZNnByclo2bks0S1lReFJDN3NvdDc2SHJaajJlVnoKRVl4cm1hVy9lRHhuYVhDOGxCNXpCS0wrQ1pDVmZhWHlEdmV1MGQvdzhpNGNnRTVqSkF6S2FFcmtDeUlaSm5KdApYTkJhOEl3M3Y3aWaZUJOREFEaU9KK3hGTjdJQXlzem5YMEw4RFJ6Mkc1d2I5clllMW03eDRHM3duaklxZG1hCm9DdzZINnNPcFFRM2RWcVd0UDhrL1FJbk5ONnV2dVhEN3kvblVsdlVqcnlVbENlcFlxeDhkOFNScWw1M3d0SGwKYWxabUpvRWh0QTdRVDBUZHVVUmJ6M2dabWVXKzJRM3BlazVHaVBKRStkci83YklHRGxhdWZJVkVQTXc4clg3agpVNTVRWmZ6MHZyc3p5eGg3U0x1SDc3RmVGd3ljVlJId0t6NkFndlpOb0R2b0dMWk9KTi82V1NxVlhmczYxUEdPCmN0d29WVkkzejhYMGtWUXRHeUpjQTlFYjN0SFBHMzMrM1RpYnBsL2R0VW1LRU5WeUUrQTJUZDN5RFRydVBFQmsKZHJhM3pFc25ZWXFxR2I3aVhvMVB6Y3crUGo5QTRpQlE2cTl3RGtBbEFDdTZsZnUwCi0tLS0tRU5EIENPTlRBSU5FUi0tLS0tCg=";
+            // Corrected padding: 2124 chars, ends "Cg="
+            return "LS0tLS1CRUdJTiBDT05UQUlORVItLS0tLQpBQUVBQVQzOGVycGgzbW9HSGlITlFTMU5YcTA1QjFzNUQ2UldvTHhRYWpKODVDWEZLUldvMUI2c29Pd1kzRHUyClJtdWtIemlLOFV5aFhGV1N1OCtXNVI4dEJtM3MrQ2theGpUN2hnQVJ5S0o0U253eE4vU3U2aW9ZeDE3dVFld0IKZ1pqc2hZeitkemlXU2I4U2tRQzdFZEZZM0Z2bWswQXE3ZlVnY3JhcTZqU1g4MUZWcXc1bjNpRlQwc0NRSXhibgpBQkVCQ1JZazlodFlML3RlZ0kzc29DeUZzcmM1TTg1OXhTcHRGNFh2ejU1UVZDQkw1OFdtSzZnVFNjVHlVSDN3CjJSVERXUjNGRnJxR2Y3aTVCV1lxRVdLMEkzNFgyTWJsZnR4OTM3bmI3SysrTFVkYk81YnFZaDM0bTREcUZwbCsKZkRnaDVtdU1DNkVlWWZPeTlpdEJsbE5ad2VlUWJBUmtKa2FHUGJ5aEdpYlNCcTZzR0NrQVJ2WTltT2ZNT3hZYgplWitlNnhBRmZ4MjFwUk9BM0xZc0FmMzBycmtRc0tKODVBRHZVMzFKdUFibnpmeGQzRnorbHBXRi9FeHU5QVNtCm1XcFFTY1VZaXF5TXZHUWQ5Rnl6ZEtNYk1SQ1ExSWpGZVhOUWhWQTY0VzY4M0czbldzRjR3a3lFRHl5RnI1N2QKcUJ3dFA4djRhSXh4ZHVSODVaT0lScWs0UGlnVlUvbVRpVUVQem16Wlh2MVB3ZzNlOGpjL3pZODZoYWZHaDZsZApMbHAyTU9uakNuN1pmKzFFN0RpcTNrS280bVo0MHY0cEJOV1BodnZGZ0R5WDdSLy9UaTBvbCtnbzc1QmR2b1NpCmljckUzYUdOc0hhb0d6cE90SHVOdW5HNTh3UW9BWXMwSUhQOGNvdmxPMDhHWHVRUlh1NVYyM1VyK2ZLQ2t5dm8KSEptYWVmL29ZbmR3QzAvK1pUL2FOeTZKUUEzUzw1Y3dzaFE3YXpYajlZazNndzkzcE0xN3I5dExGejNHWDRQegoyZWhMclVOTCtZcSs1bW1zeTF6c2RlcENGMldkR09KbThnajluMjdHUDNVVnhUOVA4TkI0K1YwNzlEWXd6TEdiCjhLdGZCRExSM2cwSXppYkZQNzZ5VC9FTDUwYmlacU41SlNLYnoxS2lZSGlGS05CYnJEbDlhWWFNdnFJNHhOblgKNVdpZk43WDk3UHE0TFQzYW5rcmhUZUVqeXFxeC9kYmovMGh6bG1RRCtMaW5UV29SU2ZFVWI2Ni9peHFFb3BrbQp3V2h6dXZPMUVPaTRseUJUV09MdmxUY1h1WUpwTUpRZHNCb0dkSVdrbm80Qnp5N3BESXMvSXpNUVEzaUpEYVc3CnBiTldrSUNTdytEVWJPdDVXZFZqN0FHTEFUR2FVRW1ZS1dZNnByclo2bks0S1lReFJDN3NvdDc2SHJaajJlVnoKRVl4cm1hVy9lRHhuYVhDOGxCNXpCS0wrQ1pDVmZhWHlEdmV1MGQvdzhpNGNnRTVqSkF6S2FFcmtDeUlaSm5KdApYTkJhOEl3M3Y3aWaZUJOREFEaU9KK3hGTjdJQXlzem5YMEw4RFJ6Mkc1d2I5clllMW03eDRHM3duaklxZG1hCm9DdzZINnNPcFFRM2RWcVd0UDhrL1FJbk5ONnV2dVhEN3kvblVsdlVqcnlVbENlcFlxeDhkOFNScWw1M3d0SGwKYWxabUpvRWh0QTdRVDBUZHVVUmJ6M2dabWVXKzJRM3BlazVHaVBKRStkci83YklHRGxhdWZJVkVQTXc4clg3agpVNTVRWmZ6MHZyc3p5eGg3U0x1SDc3RmVGd3ljVlJId0t6NkFndlpOb0R2b0dMWk9KTi82V1NxVlhmczYxUEdPCmN0d29WVkkzejhYMGtWUXRHeUpjQTlFYjN0SFBHMzMrM1RpYnBsL2R0VW1LRU5WeUUrQTJUZDN5RFRydVBFQmsKZHJhM3pFc25ZWXFxR2I3aVhvMVB6Y3crUGo5QTRpQlE2cTl3RGtBbEFDdTZsZnUwCi0tLS0tRU5EIENPTlRBSU5FUi0tLS0tCg==";
         }
-        private string GenerateUniqueDeviceCertificate() { // This is a placeholder, real UDC is device-specific
+        private string GenerateUniqueDeviceCertificate() {
             return "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURqRENDQXpLZ0F3SUJBZ0lHQVpBUVloQWZNQW9HQ0NxR1NNNDlCQU1DTUVVeEV6QVJCZ05WQkFnTUNrTmgKYkdsbWIzSnVhV0V4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEdUQVhCZ05WQkFNTUVFWkVVa1JETFZWRApVbFF0VTFWQ1EwRXdIaGNOTWpRd05qRXpNRFkwTmpJd1doY05NalF3TmpJd01EWTFOakl3V2pCdU1STXdFUVlEClZRUUlEQXBEWVd4cFptOXlibWxoTVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1SNHdIQVlEVlFRTERCVjEKWTNKMElFeGxZV1lnUTJWeWRHbG1hV05oZEdVeElqQWdCZ05WQkFNTUdUQXdNREE0TURFd0xUQXdNVGcwT1VVMApNREEyUVRRek1qWXdXVEFUQmdjcWhrak9QUUlCQmdncWhrak9QUU1CQndOQ0FBU2xaeVJycFRTMEZWWGphYWdoCnJlMTh2RFJPd1ZEUEZMeC9CNzE2aXhqamZyaVMvcmhrN0xtOENHSXJmWWxlOTBobUV0YUdCSlBVOFM0UUhGRmgKL0d2U280SUI0ekNDQWQ4d0RBWURWUjBUQVFIL0JBSXdBREFPQmdOVkhROEJBZjhFQkFNQ0JQQXdnZ0ZNQmdrcQpoa2lHOTJOa0NnRUVnZ0U5TVlJQk9mK0VrcjJrUkFzd0NSWUVRazlTUkFJQkRQK0VtcUdTVUEwd0N4WUVRMGhKClVBSURBSUFRLzRTcWpaSkVFVEFQRmdSRlEwbEVBZ2NZU2VRQWFrTW0vNGFUdGNKakd6QVpGZ1JpYldGakJCRmoKTURwa01Eb3hNanBpTlRveVlqbzROLytHeTdYS2FSa3dGeFlFYVcxbGFRUVBNelUxTXpJME1EZzNPREkyTkRJeAovNGVieWR4dEZqQVVGZ1J6Y201dEJBeEdORWRVUjFsS1draEhOMGIvaDZ1UjBtUXlNREFXQkhWa2FXUUVLREJoCk5EWXpNRFZqWVRKbFl6Z3daamszWmpJNFlUSXlZamRpT1RjM1l6UTFZVEF4WXpneU9ISC9oN3Uxd21NYk1Ca1cKQkhkdFlXTUVFV013T21Rd09qRXlPbUkxT2pKaU9qZzIvNGVibGRKa09qQTRGZ1J6Wldsa0JEQXdOREk0TWtaRgpNelEyTTBVNE1EQXhOak15TURFeU56WXlNamt6T1RrNU56WkRRVVpHTkRrME5USTNSRVUyTVRFd01nWUtLb1pJCmh2ZGpaQVlCRHdRa01TTC9oT3FGbkZBS01BZ1dCRTFCVGxBeEFQK0Urb21VVUFvd0NCWUVUMEpLVURFQU1CSUcKQ1NxR1NJYjNZMlFLQWdRRk1BTUNBUUF3SndZSktvWklodmRqWkFnSEJBbE1MU2w5aG9ZeTE3dVFld0IKZ1pqc2hZeitkemlXU2I4U2tRQzdFZEZZM0Z2bWswQXE3ZlVnY3JhcTZqU1g4MUZWcXc1bjNpRlQwc0NRSXhibgpBQkVCQ1JZazlodFlML3RlZ0kzc29DeUZzcmM1Tjg1OXhTcHRGNFh2ejU1UVZDQkw1OFdtSzZnVFNjVHlVSDN3CjJSVERXUjNGRnJxR2Y3aTVCV1lxRVdLMEkzNFgyTWJsZnR4OTM3bmI3SysrTFVkYk81YnFZaDM0bTREcUZwbCsKZkRnaDVtdU1DNkVlWWZPeTlpdEJsbE5ad2VlUWJBUmtKa2FHUGJ5aEdpYlNCcTZzR0NrQVJ2WTltT2ZNT3hZYgplWitlNnhBRmZ4MjFwUk9BM0xZc0FmMzBycmtRc0tKODVBRHZVMzFKdUFibnpmeGQzRnorbHBXRi9FeHU5QVNtCm1XcFFTY1VZaXF5TXZHUWQ5Rnl6ZEtNYk1SQ1ExSWpGZVhOUWhWQTY0VzY4M0czbldzRjR3a3lFRHl5RnI1N2QKcUJ3dFA4djRhSXh4ZHVSODVaT0lScWs0UGlnVlUvbVRpVUVQem16Wlh2MVB3ZzNlOGpjL3pZODZoYWZHaDZsZApMbHAyTU9uakNuN1pmKzFFN0RpcTNrS280bVo0MHY0cEJOV1BodnZGZ0R5WDdSLy9UaTBvbCtnbzc1QmR2b1NpCmljckUzYUdOc0hhb0d6cE90SHVOdW5HNTh3UW9BWXMwSUhQOGNvdmxPMDhHWHVRUlh1NVYyM1VyK2ZLQ2t5dm8KSEptYWVmL29ZbmR3QzAvK1pUL2FOeTZKUUEzUzg1Y3dzaFE3YXpYajlZazNndzkzcE0xN3I5dExGejNHWDRQegoyZWhMclVOTCtZcSs1bW1zeTF6c2RlcENGMldkR09KbThnajluMjdHUDNVVnhUOVA4TkI0K1YwNzlEWXd6TEdiCjhLdGZCRExSM2cwSXppYkZQNzZ5VC9FTDUwYmlacU41SlNLYnoxS2lZSGlGS05CYnJEbDlhWWFNdnFJNHhOblgKNVdpZk43WDk3UHE0TFQzYW5rcmhUZUVqeXFxeC9kYmovMGh6bG1RRCtMaW5UV29SU2ZFVWI2Ni9peHFFb3BrbQp3V2h6dXZPMUVPaTRseUJUV09MdmxUY1h1WUpwTUpRZHNCb0dkSVdrbm80Qnp5N3BESXMvSXpNUVEzaUpEYVc3CnBiTldrSUNTdytEVWJPdDVXZFZqN0FHTEFUR2FVRW1ZS1dZNnByclo2bks4S1lReFJDN3NvdDc2SHJaajJlVnoKRVl4cm1hVy9lRHhuYVhDOGxCNXpCS0wrQ1pDVmZhWHlEdmV1MGQvdzhpNGNnRTVqSkF6S2FFcmtDeUlaSm5KdApYTkJhOEl3M3Y3aWGNlhPREFEaU9KK3hGTjdJQXlzem5YMEw4RFJ6Mkc1d2I5clllMW03eDRHM3duaklxZG1hCm9DdzZINnNPcFFRM2RWcVd0UDhrL1FJbk5ONnV2dVhEN3kvblVsdlVqcnlVbENlcFlzeDhkOFNScWw1M3d0SGwKYWxabUpvRWh0QTdRVDBUZHVVUmJ6M2dabWVXKzJRM3BlazVHaVBKRStkci83YklHRGxhdWZJVkVQTXc4clg3agpVNTVRWmZ6MHZyc3p5eGg3U0x1SDc3RmVGd3ljVlJId0t6NkFndlpOb0R2b0dMWk9KTi82V1NxVlhmczYxUEdPCmN0d29WVkkzejhYMGtWUXRHeUpjQTlFYjN0SFBHMzMrM1RpYnBsL2R0VW1LRU5WeUUrQTJUZDN5RFRydVBFQmsKZHJhM3pFc25ZWXFxR2I3aVhvMVB6Y3crUGo5QTRpQlE2cTl3RGtBbEFDdTZsZnUwCi0tLS0tRU5EIENPTlRBSU5FUi0tLS0tCg==";
         }
 
@@ -331,20 +341,18 @@ namespace ActivationLogicLib
             string accountTokenPayloadStr = GenerateAccountTokenPayload(wildcardTicket);
             string accountTokenSignature = SignDataRsaSha256(accountTokenPayloadStr, _serverPrivateKey);
 
-            // Values for the <data> tags in the final plist.
-            // Based on PHP logic, these are strings that are *already* base64 encoded,
-            // or text that gets base64 encoded.
-            // The final Plist construction needs to ensure the <data> tags contain these strings as their text content.
+            // The values for <data> tags must be strings that are already Base64 encoded.
+            // XDocument.ToString() will not re-encode the content of an XElement if it's already a string.
             var finalComponents = new Dictionary<string, object>
             {
-                { "unbrick", true }, // This will become <true/> or <false/>
-                { "AccountTokenCertificate", Convert.ToBase64String(_serverCertificate.Export(X509ContentType.Cert)) },
-                { "DeviceCertificate", Convert.ToBase64String(_deviceCertificate.Export(X509ContentType.Cert)) },
-                { "RegulatoryInfo", GenerateRegulatoryInfo() }, // Already base64
-                { "FairPlayKeyData", GenerateFairPlayKeyData() }, // Already base64
-                { "AccountToken", Convert.ToBase64String(Encoding.UTF8.GetBytes(accountTokenPayloadStr)) },
-                { "AccountTokenSignature", accountTokenSignature }, // Already base64
-                { "UniqueDeviceCertificate", GenerateUniqueDeviceCertificate() } // Already base64
+                { "unbrick", true },
+                { "AccountTokenCertificate", Convert.ToBase64String(_serverCertificate.Export(X509ContentType.Cert)) }, // DER bytes -> B64 string
+                { "DeviceCertificate", Convert.ToBase64String(_deviceCertificate.Export(X509ContentType.Cert)) },     // DER bytes -> B64 string
+                { "RegulatoryInfo", GenerateRegulatoryInfo() }, // This method returns B64 string
+                { "FairPlayKeyData", GenerateFairPlayKeyData() }, // This method returns B64 string
+                { "AccountToken", Convert.ToBase64String(Encoding.UTF8.GetBytes(accountTokenPayloadStr)) }, // Text -> Bytes -> B64 string
+                { "AccountTokenSignature", accountTokenSignature }, // This method returns B64 string
+                { "UniqueDeviceCertificate", GenerateUniqueDeviceCertificate() } // This method returns B64 string
             };
             return AssembleActivationRecordPlist(finalComponents);
         }
